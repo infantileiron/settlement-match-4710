@@ -9,4 +9,7 @@ def create(db,body):
  if not db.get(StatementBatch,body.batch_id):raise HTTPException(422,"对账批次不存在")
  if not normalize(body.party) or not body.external_id.strip():raise HTTPException(422,"往来方或ID为空")
  if db.scalar(select(SettlementItem).where(SettlementItem.batch_id==body.batch_id,SettlementItem.external_id==body.external_id)):raise HTTPException(409,"同批次分录ID已存在")
- row=SettlementItem(id=str(uuid4()),**body.model_dump());db.add(row);db.commit();return row
+ row=SettlementItem(id=str(uuid4()),**body.model_dump());db.add(row);db.commit()
+ from .ledger_service import recalculate_for_batch
+ recalculate_for_batch(db,body.batch_id)
+ return row

@@ -1,3 +1,15 @@
--- SQLAlchemy creates batches, items, policies, runs, reviews, reports, users, audits on a new MySQL database.
+-- SQLAlchemy creates batches, items, policies, runs, reviews, reports, users, audits
+-- and the cross-period ledger tables (ledgers, ledger_periods, ledger_balances,
+-- ledger_allocations, ledger_variances, ledger_commissions, ledger_receipts)
+-- on a new MySQL database.
 -- Amounts and amount tolerances use BIGINT. Non-monetary scoring parameters use DOUBLE.
 -- Unique(batch_id, external_id) prevents duplicate ledger IDs. Existing deployments need reviewed migrations.
+--
+-- Ledger idempotency relies on:
+--   uq_ledger_batch_name (batch_id, name)
+--   uq_ledger_period (ledger_id, period)
+--   uq_ledger_balance (ledger_id, period, commission_external_id)
+--   uq_ledger_allocation (ledger_id, period, commission_external_id, receipt_external_id, sequence)
+--   uq_ledger_commission / uq_ledger_receipt / uq_ledger_variance
+-- Recalculation locks the ledger row and deletes/rewrites only open periods, so a
+-- repeated or concurrent run converges on one balance set instead of adding another.

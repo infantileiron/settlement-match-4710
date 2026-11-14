@@ -1,12 +1,12 @@
 # 长川译务 · 结算凭证勾稽
 
-对模拟委托里程碑与入账凭证，先做含拒配节点的全局一对一匹配，再对余项搜索受限合并付款，保留整数分、原始ID、匹配口径与未配项，供人工复核。
+对模拟委托里程碑与入账凭证，先做含拒配节点的全局一对一匹配，再对余项搜索受限合并付款，保留整数分、原始ID、匹配口径与未配项，供人工复核。另有跨期余额台账：月末未清委托按凭证逐次抵扣，跨月只结转未清部分，已关账月份不回写、差额单列。
 
 ## 场景
 
 长川译务结算组14人原来用 `changchuan_settlement_202611.csv` 逐行人工核销。三个痛点是同额不代表同单、合并付款难找、金额精度与容差混用。上游为模拟委托/凭证底册；本项目替代候选勾稽与复核留档；下游由结算负责人逐项核准。没有银行连接、真实账本写入或自动核销。
 
-六实体贯穿表、Python Model/Schema/Service/Controller/Route、Vue API/Store/页面：StatementBatch、SettlementItem、MatchPolicy、MatchRun、MatchReview、Report。六业务页为总览、对账批次、委托与凭证、匹配口径、运行底稿、复核归档，另有管理员审计。
+六实体贯穿表、Python Model/Schema/Service/Controller/Route、Vue API/Store/页面：StatementBatch、SettlementItem、MatchPolicy、MatchRun、MatchReview、Report。六业务页为总览、对账批次、委托与凭证、匹配口径、运行底稿、复核归档，另有管理员审计。跨期余额为第七业务页（`/ledger`），由 `BalanceLedger/LedgerPeriod/LedgerBalance/LedgerAllocation/LedgerVariance/LedgerCommission/LedgerReceipt` 支撑，不改变原六实体匹配口径。
 
 ## 启动
 
@@ -29,7 +29,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 恰好frontend/backend/worker/db/redis；数据库、Redis和共享心跳产物具名卷。清理 `docker compose down -v --remove-orphans`，保留数据时省略 `-v`。
 
-目录：`backend/src/{models,schemas,services,controllers,routes}`按六实体分层；`input_records.py`校验、`compatibility.py`硬约束与非货币评分、`hungarian.py`双侧拒配、`subset_sum.py`受限组合、`reconcile.py`两阶段及输入哈希。`config,utils,middlewares`提供数据库、JWT/口令摘要、队列、审计和错误。种子在 `backend/scripts/seed_demo.py`，`migrations/001_schema.sql`说明新库基线，实际以元数据建表。
+目录：`backend/src/{models,schemas,services,controllers,routes}`按六实体分层；`input_records.py`校验、`compatibility.py`硬约束与非货币评分、`hungarian.py`双侧拒配、`subset_sum.py`受限组合、`reconcile.py`两阶段及输入哈希。`ledger_engine.py`为无ORM的跨期抵扣/结转内核，`ledger_service.py`负责加锁重算、关账与差额持久化。`config,utils,middlewares`提供数据库、JWT/口令摘要、队列、审计和错误。种子在 `backend/scripts/seed_demo.py`，`migrations/001_schema.sql`说明新库基线，实际以元数据建表。
 
 前端 `src/{api,stores,types,constants,hooks,utils,router,pages}`，MatchMetrics/MatchFlow/MatchLedger/UnmatchedTable跨总览、结果、归档复用。测试、截图、日志位于批次外层 `test-artifacts/gb-2308`，不进入本源码目录。
 
@@ -79,9 +79,21 @@ DP状态为(整数金额和,项数)，每个候选只遍历一次，用状态快
 
 **两阶段不保证一对多联合全局最优**：第一阶段已固定，第二阶段有顺序、候选/组大小/金额/状态限制。界面展示搜索限制；未配项不等于凭证错误或不存在真实关联。本工具只生成可复核候选，不作实际资金处置。
 
+## 跨期余额台账
+
+匹配之后，月末未清委托常跨月分次到账，整笔勾稽算不出剩余欠款。余额台账按“委托 + 凭证逐次抵扣”重算：
+
+- **硬关联**：同币种、同归一往来方、同归一引用才可抵扣；金额不同也可逐次抵扣，引用为空只与同为空的委托关联。先到期先抵（按凭证入账日期、ID），每笔凭证原额 = 已抵扣 + 余款。
+- **逐次明细**：每次抵扣保存账期、委托ID、凭证ID、整数分金额与顺序；每笔委托保存原额、期初、当月新增、当月抵扣、期末、累计抵扣与结转来源月份。恒等式 `原额 = 累计抵扣 + 未清余额` 逐笔校验，聚合校验写入台账 checks。
+- **只结转未清**：当月新委托以“新增”入账，次月起仅未清部分作为期初；已结清委托不再结转，重复执行只删除并重写开放账期，不新增重复余额。
+- **并发/幂等**：重算先锁台账行；开放期行按唯一键（台账+账期+委托/凭证+顺序）重建，唯一冲突时回滚重试一次，多人同时重算或重复点击都收敛到同一份余额；关账接口重复调用返回 `changed=false`。
+- **前期补记**：批次内补录分录会自动重算所有活动台账；补记凭证按 `start` 账期生效并标记来源，后续开放月份余额随之重算。
+- **已关账保护**：月份按顺序关账（管理员）。关账后的月不再回写；重算时用冻结余额作为结转起点，并用新输入重算对比，差额逐项写入 `variances`（保留值、重算值、差额、原因：前期补记/新增委托/重算推移），只列示不改账。开放账期仍满足恒等式。
+- **页面回查**：`/ledger` 按月份列出期初/新增/抵扣/期末，点月份显示每笔委托余额；展开委托可见该月逐笔抵扣、来源标签（当期/结转凭证余款/前期补记）与历史期抵扣，凭证表逐分显示已抵扣与余款。接口 `GET /ledgers/{id}/months/{period}` 提供同一视图。
+
 ## 一天的模拟工作日
 
-Seed为80委托、65凭证：50个常规一对一、10组两委托合并、同额干扰以及往来方/引用/日期不兼容和无来源反例，币种CNY。
+Seed为80委托、65凭证：50个常规一对一、10组两委托合并、同额干扰以及往来方/引用/日期不兼容和无来源反例，币种CNY。另建跨期台账演示批次：3委托、7凭证，含10月部分到账、11月分次到账、12月结清与无来源凭证，预览“跨期余额”页即可看到未清结转与凭证余款。
 
 1. 09:00 导入 `changchuan_settlement_202611.csv`，检查145条分录、整数分和唯一ID。
 2. 09:05 打开委托/凭证台账，核对往来方、引用和业务日期。
@@ -91,11 +103,12 @@ Seed为80委托、65凭证：50个常规一对一、10组两委托合并、同�
 6. 09:25 切换合并付款，按原始委托ID核对组合；未配项保留原记录与搜索限制。
 7. 09:30 分析师提交人工复核，管理员批准输入哈希、候选和结论边界。
 8. 09:36 viewer下载包含匹配与未配项的CSV；不写任何银行或真实账本。
+9. 09:40 打开跨期余额，核对10月部分到账后的未清余额、11月分次抵扣与12月结清；关账10月后补记一笔10月到账，查看差额行与开放月重算结果。
 
 种子自然键幂等，重复执行不覆盖用户修改的批次说明。
 
 ## 已知差异
 
-MySQL采用8.4 LTS而非8.0；Redis列表无worker崩溃自动重投/取消；新库建表无存量库版本化迁移回滚。仅CNY模拟，不做跨币种换汇、银行连接、自动核销或多币种清算。第二阶段受限且有顺序，不是混合一对一/一对多的联合最优求解。Google Fonts离线回退字体。
+MySQL采用8.4 LTS而非8.0；Redis列表无worker崩溃自动重投/取消；新库建表无存量库版本化迁移回滚。仅CNY模拟，不做跨币种换汇、银行连接、自动核销或多币种清算。第二阶段受限且有顺序，不是混合一对一/一对多的联合最优求解。跨期余额按“同方同引用”硬关联，不做同方多委托自动分摊；已关账差额只列示、不自动生成调整分录。Google Fonts离线回退字体。
 
 MIT License。真实检查见批次 `test-artifacts/gb-2308/TESTING.md`。
